@@ -1,0 +1,517 @@
+bun.build.ts file:
+import { type BunPlugin, type BuildConfig } from "bun";
+import { marked } from "marked";
+import matter from "gray-matter";
+import mustache from "mustache";
+import { join, dirname, relative, basename } from "path";
+import { readdir, mkdir } from "fs/promises";
+import { trackDependencies } from "./deps";
+
+const publicDir = join(process.cwd(), "public");
+const distPublicDir = join(process.cwd(), "dist/public");
+
+async function syncPublicFolder() {
+  try {
+    // Only copy if public dir exists
+    if (await Bun.file(publicDir).exists()) {
+      // Use Bun's native copy with differential sync
+      await Bun.$`cp -Ru ${publicDir} ${distPublicDir}`.quiet();
+    }
+  } catch (error) {
+    console.error("Public folder sync error:", error);
+  }
+}
+
+// ========================
+// MARKDOWN PROCESSING PLUGIN
+// ========================
+const mdPlugin: BunPlugin = {
+  name: "Markdown Processor",
+  setup(build) {
+    build.onLoad({ filter: /\.md$/ }, async ({ path }) => {
+      console.log("Processing:", path);
+
+      // 1. Parse Frontmatter & Content
+      const raw = await Bun.file(path).text();
+      const { data: frontmatter, content } = matter(raw);
+
+      // 2. Resolve Partials
+      const { resolved, partialPaths } = await resolvePartials(content);
+
+      // 3. Render Mustache Templates
+      const templateData = {
+        ...frontmatter,
+        assets: relative(process.cwd(), join(dirname(path), "assets")),
+        baseUrl: process.env.BASE_URL || "/",
+      };
+
+      const partials: Record<string, string> = {
+        async: await readPartial("async"),
+      };
+
+      const rendered = mustache.render(resolved, templateData, partials);
+
+      // 4. Convert to HTML
+      const html = marked.parse(rendered);
+
+      // 5. Apply Layout
+      const layout = (frontmatter.layout as string) || "default";
+      const layoutPath = join(process.cwd(), "layouts", `${layout}.html`);
+      const layoutHtml = await Bun.file(layoutPath).text();
+
+      const finalHtml = mustache.render(layoutHtml, {
+        ...templateData,
+        content: html,
+        styles: Bun.file("./public/styles/main.css"),
+        scripts: Bun.file("./public/scripts/app.js"),
+      });
+
+      // 6. Track Dependencies
+      trackDependencies(path, layoutPath, partialPaths);
+
+      // 7. Write Output
+      const outputPath = path.endsWith("index.md")
+        ? join("dist", "index.html")
+        : join(
+            "dist",
+            relative("content", path).replace(/\.md$/, "/index.html"),
+          );
+
+      await mkdir(dirname(outputPath), { recursive: true });
+      await Bun.write(outputPath, finalHtml);
+
+      return { contents: finalHtml, loader: "text" };
+    });
+  },
+};
+
+// ========================
+// PLUGIN ASSETS: Copy Static Assets
+// ========================
+const assetsPlugin: BunPlugin = {
+  name: "Assets Plugin",
+  setup(build) {
+    // Only handle non-public assets
+    build.onResolve({ filter: /\.(jpg|png|gif|css|js|svg)$/ }, ({ path }) => {
+      if (path.startsWith(publicDir)) return { path, external: true };
+      return { path, namespace: "assets" };
+    });
+
+    build.onLoad({ filter: /.*/, namespace: "assets" }, async ({ path }) => {
+      const outputPath = join(
+        "dist",
+        relative("content", dirname(path)),
+        basename(path),
+      );
+
+      // Only copy if modified
+      const srcStat = (await Bun.file(path).stat()).mtimeMs;
+      const destStat = await Bun.file(outputPath)
+        .stat()
+        .then((stat) => stat.mtimeMs)
+        .catch(() => 0);
+
+      if (srcStat > destStat) {
+        await Bun.write(outputPath, await Bun.file(path).arrayBuffer());
+      }
+
+      return { contents: await Bun.file(path).text(), loader: "file" };
+    });
+  },
+};
+
+// ========================
+// HELPER: Get All Markdown Files (Excludes _ Folders)
+// ========================
+async function getMarkdownFiles(dir: string): Promise<string[]> {
+  const files = await readdir(dir, { withFileTypes: true });
+  let paths: string[] = [];
+
+  for (const file of files) {
+    const fullPath = join(dir, file.name);
+
+    if (file.isDirectory()) {
+      if (!file.name.startsWith("_")) {
+        paths = paths.concat(await getMarkdownFiles(fullPath));
+      }
+    } else if (file.name.endsWith(".md")) {
+      paths.push(fullPath);
+    }
+  }
+
+  return paths;
+}
+
+// ========================
+// HELPER: Resolve Partials with Path Tracking
+// ========================
+async function resolvePartials(
+  content: string,
+): Promise<{ resolved: string; partialPaths: string[] }> {
+  const partialRegex = /\{\{>\s*([\w\/.-]+)\s*\}\}/g;
+  let result = content;
+  const partialPaths: string[] = [];
+
+  for (const match of content.matchAll(partialRegex)) {
+    const [fullMatch, partialName] = match;
+    const partialPath = join(
+      process.cwd(),
+      "content/_partials",
+      `${partialName}.md`,
+    );
+    partialPaths.push(partialPath);
+
+    const partialFile = Bun.file(partialPath);
+    if (await partialFile.exists()) {
+      const partial = await partialFile.text();
+      result = result.replace(fullMatch, partial);
+    } else {
+      console.error(
+        `⚠️ Warning: Partial '${partialName}' not found at ${partialPath}`,
+      );
+      result = result.replace(
+        fullMatch,
+        `<!-- Missing partial: ${partialName} -->`,
+      );
+    }
+  }
+
+  return { resolved: result, partialPaths };
+}
+
+// ========================
+// HELPER: Read Partial File Safely
+// ========================
+async function readPartial(partialName: string): Promise<string> {
+  const partialPath = join("content/_partials", `${partialName}.md`);
+  const partialFile = Bun.file(partialPath);
+
+  return (await partialFile.exists()) ? await partialFile.text() : "";
+}
+
+// ========================
+// BUILD CONFIG
+// ========================
+const build = async (filesToBuild?: string[]) => {
+  await syncPublicFolder();
+  const mdFiles = filesToBuild ?? (await getMarkdownFiles("content"));
+  await Bun.build({
+    entrypoints: mdFiles,
+    outdir: "./dist",
+    plugins: [mdPlugin, assetsPlugin],
+    publicPath: "/",
+    loader: {
+      ".md": "text",
+      ".css": "file",
+      ".js": "file",
+      ".jpg": "file",
+      ".png": "file",
+      ".svg": "file",
+    },
+  } as BuildConfig);
+};
+
+export { build };
+
+config.ts file:
+import type { PathLike } from "fs";
+
+export interface XOConfig {
+  contentDir: PathLike;
+  layoutDir: PathLike;
+  partialsDir: PathLike;
+  distDir: string;
+  port?: number;
+}
+
+export const defaultConfig: XOConfig = {
+  contentDir: "content",
+  layoutDir: "layouts",
+  partialsDir: "content/_partials",
+  distDir: "dist",
+  port: 3000,
+};
+
+dev.ts file:
+import { watch } from "fs/promises";
+import { build } from "./bun.build";
+// import { spawn } from "bun";
+import { join } from "path";
+import { createHash } from "crypto";
+import type { ServerWebSocket } from "bun";
+import { reverseDependencies } from "./deps";
+
+type HashCache = Map<string, string>;
+const hashCache: HashCache = new Map();
+
+// ========================
+// FILE HASHING
+// ========================
+async function computeHash(path: string): Promise<string> {
+  try {
+    const file = await Bun.file(path).text();
+    return createHash("sha1").update(file).digest("hex");
+  } catch {
+    return "";
+  }
+}
+
+async function shouldRebuild(filePath: string): Promise<boolean> {
+  const newHash = await computeHash(filePath);
+  const oldHash = hashCache.get(filePath);
+
+  if (newHash !== oldHash) {
+    hashCache.set(filePath, newHash);
+    return true;
+  }
+  return false;
+}
+
+// ========================
+// DEVELOPMENT SERVER
+// ========================
+async function run() {
+  const ANSI = {
+    reset: "\x1b[0m",
+    cyan: "\x1b[36m",
+    green: "\x1b[32m",
+    red: "\x1b[31m",
+    yellow: "\x1b[33m",
+    magenta: "\x1b[35m",
+  };
+
+  const colors = {
+    cyan: (text: string) => `${ANSI.cyan}${text}${ANSI.reset}`,
+    green: (text: string) => `${ANSI.green}${text}${ANSI.reset}`,
+    red: (text: string) => `${ANSI.red}${text}${ANSI.reset}`,
+    yellow: (text: string) => `${ANSI.yellow}${text}${ANSI.reset}`,
+    magenta: (text: string) => `${ANSI.magenta}${text}${ANSI.reset}`,
+  };
+
+  const logger = {
+    info: (msg: string) => console.log(`[xo] ${colors.cyan(msg)}`),
+    success: (msg: string) => console.log(`[xo] ${colors.green(msg)}`),
+    error: (msg: string) => console.log(`[xo] ${colors.red(msg)}`),
+    warn: (msg: string) => console.log(`[xo] ${colors.yellow(msg)}`),
+    debug: (msg: string) => console.log(`[xo] ${colors.magenta(msg)}`),
+  };
+
+  // ========================
+  // FILE WATCHER SETUP
+  // ========================
+  const watchers = [
+    { baseDir: "content", watcher: watch("content", { recursive: true }) },
+    { baseDir: "layouts", watcher: watch("layouts", { recursive: true }) },
+    {
+      baseDir: "content/_partials",
+      watcher: watch("content/_partials", { recursive: true }),
+    },
+  ];
+
+  async function handleFileChange(event: {
+    filename?: string;
+    baseDir?: string;
+  }) {
+    const timestamp = new Date().toISOString().split("T")[1].split(".")[0];
+    if (!event.filename || !event.baseDir) return;
+    const filePath = join(event.baseDir, event.filename);
+    const displayPath = colors.cyan(filePath);
+
+    logger.info(`[${timestamp}] File changed: ${displayPath}`);
+    if (!(await shouldRebuild(filePath))) {
+      logger.info(`[${timestamp}] Skipping rebuild for ${displayPath}`);
+      return;
+    }
+
+    const affectedMdFiles = new Set<string>();
+
+    // Add directly changed Markdown files
+    if (filePath.endsWith(".md")) {
+      affectedMdFiles.add(filePath);
+    }
+
+    // Find reverse dependencies
+    if (reverseDependencies.has(filePath)) {
+      reverseDependencies
+        .get(filePath)
+        ?.forEach((mdFile) => affectedMdFiles.add(mdFile));
+    }
+
+    try {
+      if (affectedMdFiles.size > 0) {
+        await build(Array.from(affectedMdFiles));
+      } else {
+        await build();
+      }
+      server.publish("reload", "refresh");
+      logger.success(`[${timestamp}] Rebuild successful!`);
+    } catch (error) {
+      logger.error(
+        `[${timestamp}] Rebuild failed: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  // ========================
+  // SERVER INITIALIZATION
+  // ========================
+  const server = Bun.serve({
+    port: 3000,
+    async fetch(req: Request): Promise<Response | undefined> {
+      const url = new URL(req.url);
+      const publicDir = join(process.cwd(), "public");
+
+      if (url.pathname.startsWith("/public/")) {
+        const filePath = join(publicDir, url.pathname.replace("/public/", ""));
+        const file = Bun.file(filePath);
+        if (await file.exists()) {
+          return new Response(file);
+        }
+        return new Response("Not Found", { status: 404 });
+      }
+
+      if (url.pathname === "/__ws") {
+        return server.upgrade(req)
+          ? undefined
+          : new Response("WebSocket upgrade failed", { status: 400 });
+      }
+
+      try {
+        const file = Bun.file(`./dist${url.pathname}/index.html`);
+        if (!(await file.exists())) {
+          return new Response("Not Found", { status: 404 });
+        }
+
+        let html = await file.text();
+        html = html.replace(
+          "</body>",
+          `<script>
+                let ws = new WebSocket('ws://${req.headers.get("host")}/__ws');
+                ws.onmessage = () => window.location.reload();
+                ws.onclose = () => console.log("[Live Reload] Disconnected");
+                setInterval(() => { if (ws.readyState !== 1) ws = new WebSocket('ws://${req.headers.get("host")}/__ws'); }, 5000);
+              </script></body>`,
+        );
+        return new Response(html, { headers: { "Content-Type": "text/html" } });
+      } catch {
+        return new Response("Not Found", { status: 404 });
+      }
+    },
+    websocket: {
+      open(ws) {
+        ws.subscribe("reload");
+      },
+      close(ws) {
+        ws.unsubscribe("reload");
+      },
+      message: function (
+        ws: ServerWebSocket<unknown>,
+        message: string | Buffer,
+      ): void | Promise<void> {
+        throw new Error("Function not implemented.");
+      },
+    },
+  });
+
+  // ========================
+  // STARTUP SEQUENCE
+  // ========================
+  console.log(
+    colors.yellow(`
+    █░█ █▀▀█
+    ▄▀▄ █░░█
+    ▀░▀ ▀▀▀▀ [v0.0.1]
+  `),
+  );
+
+  // Start file watchers
+  for (const { baseDir, watcher } of watchers) {
+    (async () => {
+      for await (const event of watcher) {
+        if (event.filename) {
+          handleFileChange({ filename: event.filename, baseDir });
+        }
+      }
+    })();
+  }
+
+  // Initial build
+  await build();
+  logger.success(
+    `Dev server running at ${colors.green("http://localhost:3000")}`,
+  );
+  logger.info("Watching for changes...");
+}
+
+export { run };
+
+xo.ts file:
+#!/usr/bin/env bun
+
+import { run } from "./dev";
+import { build } from "./bun.build";
+import { defaultConfig } from "./config";
+
+function showHelp() {
+  console.log(`
+    Usage:
+      xo [command] [options]
+
+    Commands:
+      dev       Start development server (default)
+      build     Production build
+      init      Create sample site structure
+      help      Show this help
+
+    Options:
+      --port    Set development server port
+      --clean   Remove build directory before build
+  `);
+}
+
+async function initProject() {
+  // Create basic directory structure
+  await Bun.write(
+    "content/index.md",
+    `---
+title: Welcome
+layout: default
+---
+
+# Hello World!
+`,
+  );
+
+  await Bun.write(
+    "layouts/default.html",
+    `<!DOCTYPE html>
+<html>
+<head>
+  <title>{{title}}</title>
+</head>
+<body>
+  {{content}}
+</body>
+</html>`,
+  );
+
+  console.log("Created sample site structure!");
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  if (args.includes("help") || args.includes("--help")) {
+    showHelp();
+  } else if (args.includes("build")) {
+    await build();
+  } else if (args.includes("init")) {
+    await initProject();
+  } else {
+    run();
+  }
+}
+
+main();
