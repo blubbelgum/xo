@@ -27,7 +27,7 @@ Installation
 
 To get started, clone the repository and install dependencies:
 
-git clone https://github.com/your-username/xo.git
+git clone https://github.com/blubblegum/xo.git
 cd xo
 bun install
 
