@@ -2,3 +2,37 @@ node_modules/
 dist/
 .vscode/
 .env
+
+# C specific
+*.o
+*.obj
+*.exe
+*.out
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Build directories
+build/
+bin/
+lib/
+Debug/
+Release/
+x64/
+x86/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+
+# Editor specific files
+*.swp
+*.swo
+*~
+.DS_Store
