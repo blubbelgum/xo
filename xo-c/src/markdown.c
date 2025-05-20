@@ -182,27 +182,200 @@ const char *xo_markdown_get_frontmatter(const xo_markdown_t *md, const char *key
     return NULL;
 }
 
-// Placeholder for markdown to HTML conversion
-// This would ideally use a proper markdown library like cmark
+// Helper function to check if a line starts with a string
+static bool starts_with(const char *str, const char *prefix) {
+    return strncmp(str, prefix, strlen(prefix)) == 0;
+}
+
+// Helper function to calculate required buffer size for a line
+static size_t html_line_size(const char *line) {
+    size_t line_len = strlen(line);
+    // Add extra space for potential HTML tags (rough estimate)
+    return line_len * 2 + 100;
+}
+
+// Simple markdown to HTML conversion
+// This implements a basic subset of markdown (headers, paragraphs, bold, italic, lists)
 int xo_markdown_to_html(const xo_markdown_t *md, char **html_output) {
     if (!md || !html_output) {
         return XO_ERROR_MEMORY_ALLOCATION;
     }
     
-    // This is a very basic placeholder that doesn't actually parse markdown
-    // In a real implementation, you would use a proper library or implement parsing
-    
-    // For now, just wrap content in basic HTML
     const char *content = md->content ? md->content : "";
-    size_t content_len = strlen(content);
-    size_t output_len = content_len + 1;  // + 1 for null terminator
     
-    *html_output = (char *)malloc(output_len);
-    if (!*html_output) {
+    // Initial allocation - we'll resize as needed
+    size_t content_len = strlen(content);
+    size_t buffer_size = content_len * 2; // Rough estimation
+    char *html = (char *)malloc(buffer_size);
+    if (!html) {
         return XO_ERROR_MEMORY_ALLOCATION;
     }
     
-    strcpy(*html_output, content);
+    size_t html_len = 0;
+    html[0] = '\0';
     
+    // Process the markdown line by line
+    char *line_start = (char *)content;
+    char *next_line;
+    bool in_list = false;
+    
+    while (line_start && *line_start) {
+        // Find the end of the line
+        next_line = strchr(line_start, '\n');
+        if (next_line) {
+            *next_line = '\0';  // Temporarily terminate the line
+        }
+        
+        // Process the line
+        char line_buffer[1024] = {0};
+        
+        // Trim trailing whitespace
+        char *line_end = line_start + strlen(line_start) - 1;
+        while (line_end >= line_start && isspace(*line_end)) {
+            *line_end = '\0';
+            line_end--;
+        }
+        
+        // Skip empty lines
+        if (strlen(line_start) == 0) {
+            if (in_list) {
+                // End the list if we were in one
+                strcpy(line_buffer, "</ul>\n");
+                in_list = false;
+            }
+        }
+        // Headers
+        else if (starts_with(line_start, "# ")) {
+            sprintf(line_buffer, "<h1>%s</h1>\n", line_start + 2);
+        }
+        else if (starts_with(line_start, "## ")) {
+            sprintf(line_buffer, "<h2>%s</h2>\n", line_start + 3);
+        }
+        else if (starts_with(line_start, "### ")) {
+            sprintf(line_buffer, "<h3>%s</h3>\n", line_start + 4);
+        }
+        else if (starts_with(line_start, "#### ")) {
+            sprintf(line_buffer, "<h4>%s</h4>\n", line_start + 5);
+        }
+        else if (starts_with(line_start, "##### ")) {
+            sprintf(line_buffer, "<h5>%s</h5>\n", line_start + 6);
+        }
+        else if (starts_with(line_start, "###### ")) {
+            sprintf(line_buffer, "<h6>%s</h6>\n", line_start + 7);
+        }
+        // List items
+        else if (starts_with(line_start, "- ") || starts_with(line_start, "* ")) {
+            if (!in_list) {
+                // Start a new list
+                strcpy(line_buffer, "<ul>\n");
+                strcat(line_buffer, "<li>");
+                strcat(line_buffer, line_start + 2);
+                strcat(line_buffer, "</li>\n");
+                in_list = true;
+            } else {
+                // Continue the list
+                strcpy(line_buffer, "<li>");
+                strcat(line_buffer, line_start + 2);
+                strcat(line_buffer, "</li>\n");
+            }
+        }
+        // Code blocks
+        else if (starts_with(line_start, "```")) {
+            // Simple code block support
+            strcpy(line_buffer, "<pre><code>\n");
+            
+            // Find the ending ```
+            if (next_line) {
+                *next_line = '\n';  // Restore newline
+                char *code_end = strstr(next_line, "```");
+                if (code_end) {
+                    // Extract code content
+                    char *code_content = next_line + 1;
+                    *code_end = '\0';  // Terminate before closing ```
+                    
+                    // Append code content
+                    strcat(line_buffer, code_content);
+                    strcat(line_buffer, "</code></pre>\n");
+                    
+                    // Skip to after the closing ```
+                    line_start = code_end + 3;
+                    next_line = strchr(line_start, '\n');
+                    if (next_line) {
+                        *next_line = '\0';
+                    }
+                    
+                    // Skip to next iteration
+                    if (next_line) {
+                        *next_line = '\n';
+                        line_start = next_line + 1;
+                    } else {
+                        line_start = NULL;
+                    }
+                    continue;
+                }
+            }
+        }
+        // Default to paragraph
+        else {
+            if (in_list) {
+                // End the list if it doesn't continue
+                strcpy(line_buffer, "</ul>\n<p>");
+                strcat(line_buffer, line_start);
+                strcat(line_buffer, "</p>\n");
+                in_list = false;
+            } else {
+                strcpy(line_buffer, "<p>");
+                strcat(line_buffer, line_start);
+                strcat(line_buffer, "</p>\n");
+            }
+        }
+        
+        // Append the processed line to the HTML
+        size_t line_buffer_len = strlen(line_buffer);
+        
+        // Check if we need to resize the buffer
+        if (html_len + line_buffer_len >= buffer_size) {
+            buffer_size = (html_len + line_buffer_len) * 2;
+            char *new_html = (char *)realloc(html, buffer_size);
+            if (!new_html) {
+                free(html);
+                return XO_ERROR_MEMORY_ALLOCATION;
+            }
+            html = new_html;
+        }
+        
+        // Append the line
+        strcat(html, line_buffer);
+        html_len += line_buffer_len;
+        
+        // Restore the newline and move to the next line
+        if (next_line) {
+            *next_line = '\n';
+            line_start = next_line + 1;
+        } else {
+            line_start = NULL;
+        }
+    }
+    
+    // Close any open list
+    if (in_list) {
+        size_t list_end_len = 6; // Length of "</ul>\n"
+        
+        // Check if we need to resize the buffer
+        if (html_len + list_end_len >= buffer_size) {
+            buffer_size = (html_len + list_end_len) * 2;
+            char *new_html = (char *)realloc(html, buffer_size);
+            if (!new_html) {
+                free(html);
+                return XO_ERROR_MEMORY_ALLOCATION;
+            }
+            html = new_html;
+        }
+        
+        strcat(html, "</ul>\n");
+        html_len += list_end_len;
+    }
+    
+    *html_output = html;
     return XO_SUCCESS;
 } 

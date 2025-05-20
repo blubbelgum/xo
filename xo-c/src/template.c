@@ -264,23 +264,186 @@ int xo_template_partials_add(xo_template_partials_t *partials, const char *name,
     return XO_SUCCESS;
 }
 
-// Placeholder for template rendering
-// This is a very basic implementation that doesn't support most Mustache features
+// Find a value in the context by key
+static const char *get_context_value(const xo_template_context_t *ctx, const char *key) {
+    if (!ctx || !key) {
+        return NULL;
+    }
+    
+    // Search for the key
+    for (size_t i = 0; i < ctx->count; i++) {
+        if (strcmp(ctx->keys[i], key) == 0) {
+            // Convert the value to string based on its type
+            switch (ctx->values[i].type) {
+                case XO_TPLVAL_STRING:
+                    return ctx->values[i].value.string_val;
+                
+                case XO_TPLVAL_INT: {
+                    // Convert int to string using a static buffer
+                    // This is not thread-safe but sufficient for our needs
+                    static char int_buffer[32];
+                    sprintf(int_buffer, "%d", ctx->values[i].value.int_val);
+                    return int_buffer;
+                }
+                
+                case XO_TPLVAL_BOOL:
+                    return ctx->values[i].value.bool_val ? "true" : "false";
+                
+                default:
+                    return NULL;
+            }
+        }
+    }
+    
+    return NULL;
+}
+
+// Find a partial by name
+static const char *get_partial(const xo_template_partials_t *partials, const char *name) {
+    if (!partials || !name) {
+        return NULL;
+    }
+    
+    // Search for the partial
+    for (size_t i = 0; i < partials->count; i++) {
+        if (strcmp(partials->names[i], name) == 0) {
+            return partials->contents[i];
+        }
+    }
+    
+    return NULL;
+}
+
+// Simple template rendering implementation with variable substitution and partials
 int xo_template_render(const char *template_str, const xo_template_context_t *ctx, 
                       const xo_template_partials_t *partials, char **output) {
     if (!template_str || !ctx || !output) {
         return XO_ERROR_MEMORY_ALLOCATION;
     }
     
-    // This is a simplified placeholder that doesn't actually parse templates properly
-    // In a real implementation, you would use a proper library or implement parsing
+    size_t template_len = strlen(template_str);
     
-    // For now, just return a copy of the template
-    *output = strdup(template_str);
-    if (!*output) {
+    // Initial allocation - we'll resize as needed
+    size_t buffer_size = template_len * 2; // Start with double the template size
+    char *result = (char *)malloc(buffer_size);
+    if (!result) {
         return XO_ERROR_MEMORY_ALLOCATION;
     }
     
+    size_t result_len = 0;
+    result[0] = '\0';
+    
+    // Process the template
+    const char *p = template_str;
+    while (*p) {
+        // Check for variable or partial tag
+        if (*p == '{' && *(p + 1) == '{') {
+            // Found the start of a tag
+            const char *tag_start = p + 2;
+            
+            // Check if it's a partial
+            bool is_partial = false;
+            if (*tag_start == '>') {
+                is_partial = true;
+                tag_start++;
+                // Skip whitespace
+                while (isspace((unsigned char)*tag_start)) {
+                    tag_start++;
+                }
+            }
+            
+            // Look for the end of the tag
+            const char *tag_end = strstr(tag_start, "}}");
+            if (tag_end) {
+                // Extract the tag name
+                size_t tag_len = tag_end - tag_start;
+                char *tag_name = (char *)malloc(tag_len + 1);
+                if (!tag_name) {
+                    free(result);
+                    return XO_ERROR_MEMORY_ALLOCATION;
+                }
+                
+                strncpy(tag_name, tag_start, tag_len);
+                tag_name[tag_len] = '\0';
+                
+                // Trim whitespace
+                char *tag_ptr = tag_name;
+                while (isspace((unsigned char)*tag_ptr)) {
+                    tag_ptr++;
+                }
+                
+                char *tag_end_ptr = tag_name + strlen(tag_ptr) - 1;
+                while (tag_end_ptr > tag_ptr && isspace((unsigned char)*tag_end_ptr)) {
+                    *tag_end_ptr = '\0';
+                    tag_end_ptr--;
+                }
+                
+                // Get the value or partial
+                const char *value = NULL;
+                if (is_partial) {
+                    value = get_partial(partials, tag_ptr);
+                } else {
+                    value = get_context_value(ctx, tag_ptr);
+                }
+                
+                if (value) {
+                    // Check if we need to resize the result buffer
+                    size_t value_len = strlen(value);
+                    if (result_len + value_len >= buffer_size) {
+                        buffer_size = (result_len + value_len) * 2;
+                        char *new_result = (char *)realloc(result, buffer_size);
+                        if (!new_result) {
+                            free(tag_name);
+                            free(result);
+                            return XO_ERROR_MEMORY_ALLOCATION;
+                        }
+                        result = new_result;
+                    }
+                    
+                    // Append the value
+                    strcat(result, value);
+                    result_len += value_len;
+                }
+                
+                free(tag_name);
+                
+                // Move past the end of the tag
+                p = tag_end + 2;
+            } else {
+                // No end tag found, just output the character
+                if (result_len + 1 >= buffer_size) {
+                    buffer_size *= 2;
+                    char *new_result = (char *)realloc(result, buffer_size);
+                    if (!new_result) {
+                        free(result);
+                        return XO_ERROR_MEMORY_ALLOCATION;
+                    }
+                    result = new_result;
+                }
+                
+                result[result_len++] = *p;
+                result[result_len] = '\0';
+                p++;
+            }
+        } else {
+            // Regular character, just copy it
+            if (result_len + 1 >= buffer_size) {
+                buffer_size *= 2;
+                char *new_result = (char *)realloc(result, buffer_size);
+                if (!new_result) {
+                    free(result);
+                    return XO_ERROR_MEMORY_ALLOCATION;
+                }
+                result = new_result;
+            }
+            
+            result[result_len++] = *p;
+            result[result_len] = '\0';
+            p++;
+        }
+    }
+    
+    *output = result;
     return XO_SUCCESS;
 }
 

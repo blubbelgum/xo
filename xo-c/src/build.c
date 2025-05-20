@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <time.h>
+#include <sys/stat.h>
 #include "build.h"
 #include "utils.h"
 #include "markdown.h"
@@ -43,6 +45,496 @@ static const char *SAMPLE_PARTIAL =
 "## This is a partial\n"
 "\n"
 "You can include this in other markdown files using the `{{> partial}}` syntax.\n";
+
+// Initialize a build cache
+int xo_build_cache_init(xo_build_cache_t *cache) {
+    if (!cache) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    cache->entries = NULL;
+    cache->count = 0;
+    cache->capacity = 0;
+    
+    return XO_SUCCESS;
+}
+
+// Free resources used by a build cache
+void xo_build_cache_free(xo_build_cache_t *cache) {
+    if (!cache) {
+        return;
+    }
+    
+    for (size_t i = 0; i < cache->count; i++) {
+        free(cache->entries[i].filepath);
+        free(cache->entries[i].hash);
+    }
+    
+    free(cache->entries);
+    
+    cache->entries = NULL;
+    cache->count = 0;
+    cache->capacity = 0;
+}
+
+// Add an entry to the build cache
+int xo_build_cache_add(xo_build_cache_t *cache, const char *filepath, const char *hash) {
+    if (!cache || !filepath || !hash) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    // Check if we need to resize the array
+    if (cache->count >= cache->capacity) {
+        size_t new_capacity = cache->capacity == 0 ? 8 : cache->capacity * 2;
+        xo_build_cache_entry_t *new_entries = realloc(cache->entries, new_capacity * sizeof(xo_build_cache_entry_t));
+        
+        if (!new_entries) {
+            return XO_ERROR_MEMORY_ALLOCATION;
+        }
+        
+        cache->entries = new_entries;
+        cache->capacity = new_capacity;
+    }
+    
+    // Check if the file is already in the cache
+    for (size_t i = 0; i < cache->count; i++) {
+        if (strcmp(cache->entries[i].filepath, filepath) == 0) {
+            // Update the hash
+            free(cache->entries[i].hash);
+            cache->entries[i].hash = strdup(hash);
+            if (!cache->entries[i].hash) {
+                return XO_ERROR_MEMORY_ALLOCATION;
+            }
+            return XO_SUCCESS;
+        }
+    }
+    
+    // Add the new entry
+    cache->entries[cache->count].filepath = strdup(filepath);
+    cache->entries[cache->count].hash = strdup(hash);
+    
+    if (!cache->entries[cache->count].filepath || !cache->entries[cache->count].hash) {
+        free(cache->entries[cache->count].filepath);
+        free(cache->entries[cache->count].hash);
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    cache->count++;
+    
+    return XO_SUCCESS;
+}
+
+// Get a hash from the build cache
+const char *xo_build_cache_get(const xo_build_cache_t *cache, const char *filepath) {
+    if (!cache || !filepath) {
+        return NULL;
+    }
+    
+    for (size_t i = 0; i < cache->count; i++) {
+        if (strcmp(cache->entries[i].filepath, filepath) == 0) {
+            return cache->entries[i].hash;
+        }
+    }
+    
+    return NULL;
+}
+
+// Compute a simple hash for a file
+int xo_compute_file_hash(const char *filepath, char **hash) {
+    if (!filepath || !hash) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    // Get the file modification time
+    struct stat st;
+    if (stat(filepath, &st) != 0) {
+        return XO_ERROR_FILE_NOT_FOUND;
+    }
+    
+    // Use the modification time as a simple hash
+    char *hash_buffer = malloc(32);
+    if (!hash_buffer) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    sprintf(hash_buffer, "%ld", (long)st.st_mtime);
+    *hash = hash_buffer;
+    
+    return XO_SUCCESS;
+}
+
+// Check if a file needs to be rebuilt
+bool xo_should_rebuild(const xo_build_cache_t *cache, const char *filepath) {
+    if (!cache || !filepath) {
+        return true;
+    }
+    
+    // Get the current hash
+    char *current_hash;
+    if (xo_compute_file_hash(filepath, &current_hash) != XO_SUCCESS) {
+        return true;
+    }
+    
+    // Get the cached hash
+    const char *cached_hash = xo_build_cache_get(cache, filepath);
+    if (!cached_hash) {
+        free(current_hash);
+        return true;
+    }
+    
+    // Compare the hashes
+    bool should_rebuild = strcmp(current_hash, cached_hash) != 0;
+    
+    free(current_hash);
+    
+    return should_rebuild;
+}
+
+// Initialize a dependency tracker
+int xo_dependency_tracker_init(xo_dependency_tracker_t *tracker) {
+    if (!tracker) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    tracker->entries = NULL;
+    tracker->count = 0;
+    tracker->capacity = 0;
+    
+    return XO_SUCCESS;
+}
+
+// Free resources used by a dependency tracker
+void xo_dependency_tracker_free(xo_dependency_tracker_t *tracker) {
+    if (!tracker) {
+        return;
+    }
+    
+    for (size_t i = 0; i < tracker->count; i++) {
+        free(tracker->entries[i].filepath);
+        
+        for (size_t j = 0; j < tracker->entries[i].dep_count; j++) {
+            free(tracker->entries[i].dependencies[j]);
+        }
+        
+        free(tracker->entries[i].dependencies);
+    }
+    
+    free(tracker->entries);
+    
+    tracker->entries = NULL;
+    tracker->count = 0;
+    tracker->capacity = 0;
+}
+
+// Add a dependency to the tracker
+int xo_dependency_tracker_add(xo_dependency_tracker_t *tracker, const char *filepath, const char *dependency) {
+    if (!tracker || !filepath || !dependency) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    // Find the entry for this file
+    size_t entry_index = (size_t)-1;
+    for (size_t i = 0; i < tracker->count; i++) {
+        if (strcmp(tracker->entries[i].filepath, filepath) == 0) {
+            entry_index = i;
+            break;
+        }
+    }
+    
+    // Create a new entry if needed
+    if (entry_index == (size_t)-1) {
+        // Check if we need to resize the array
+        if (tracker->count >= tracker->capacity) {
+            size_t new_capacity = tracker->capacity == 0 ? 8 : tracker->capacity * 2;
+            xo_dependency_entry_t *new_entries = realloc(tracker->entries, new_capacity * sizeof(xo_dependency_entry_t));
+            
+            if (!new_entries) {
+                return XO_ERROR_MEMORY_ALLOCATION;
+            }
+            
+            tracker->entries = new_entries;
+            tracker->capacity = new_capacity;
+        }
+        
+        // Initialize the new entry
+        tracker->entries[tracker->count].filepath = strdup(filepath);
+        if (!tracker->entries[tracker->count].filepath) {
+            return XO_ERROR_MEMORY_ALLOCATION;
+        }
+        
+        tracker->entries[tracker->count].dependencies = NULL;
+        tracker->entries[tracker->count].dep_count = 0;
+        tracker->entries[tracker->count].dep_capacity = 0;
+        
+        entry_index = tracker->count;
+        tracker->count++;
+    }
+    
+    // Check if the dependency is already in the list
+    xo_dependency_entry_t *entry = &tracker->entries[entry_index];
+    for (size_t i = 0; i < entry->dep_count; i++) {
+        if (strcmp(entry->dependencies[i], dependency) == 0) {
+            return XO_SUCCESS;
+        }
+    }
+    
+    // Add the dependency
+    if (entry->dep_count >= entry->dep_capacity) {
+        size_t new_capacity = entry->dep_capacity == 0 ? 8 : entry->dep_capacity * 2;
+        char **new_deps = realloc(entry->dependencies, new_capacity * sizeof(char *));
+        
+        if (!new_deps) {
+            return XO_ERROR_MEMORY_ALLOCATION;
+        }
+        
+        entry->dependencies = new_deps;
+        entry->dep_capacity = new_capacity;
+    }
+    
+    entry->dependencies[entry->dep_count] = strdup(dependency);
+    if (!entry->dependencies[entry->dep_count]) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    entry->dep_count++;
+    
+    return XO_SUCCESS;
+}
+
+// Get files that depend on a specific file
+char **xo_dependency_tracker_get_reverse(const xo_dependency_tracker_t *tracker, const char *dependency, size_t *count) {
+    if (!tracker || !dependency || !count) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Count the number of files that depend on this file
+    size_t dep_count = 0;
+    for (size_t i = 0; i < tracker->count; i++) {
+        for (size_t j = 0; j < tracker->entries[i].dep_count; j++) {
+            if (strcmp(tracker->entries[i].dependencies[j], dependency) == 0) {
+                dep_count++;
+                break;
+            }
+        }
+    }
+    
+    if (dep_count == 0) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Allocate the array
+    char **result = malloc(dep_count * sizeof(char *));
+    if (!result) {
+        *count = 0;
+        return NULL;
+    }
+    
+    // Fill the array
+    size_t result_count = 0;
+    for (size_t i = 0; i < tracker->count; i++) {
+        for (size_t j = 0; j < tracker->entries[i].dep_count; j++) {
+            if (strcmp(tracker->entries[i].dependencies[j], dependency) == 0) {
+                result[result_count] = strdup(tracker->entries[i].filepath);
+                if (!result[result_count]) {
+                    // Clean up on error
+                    for (size_t k = 0; k < result_count; k++) {
+                        free(result[k]);
+                    }
+                    free(result);
+                    *count = 0;
+                    return NULL;
+                }
+                result_count++;
+                break;
+            }
+        }
+    }
+    
+    *count = result_count;
+    return result;
+}
+
+// Build a single markdown file
+int xo_build_file(const xo_config_t *config, const char *filepath, xo_dependency_tracker_t *tracker) {
+    if (!config || !filepath || !tracker) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    xo_utils_console_info("Building file: %s", filepath);
+    
+    // Parse the markdown file
+    xo_markdown_t md;
+    if (xo_markdown_parse_file(filepath, &md) != XO_SUCCESS) {
+        xo_utils_console_error("Failed to parse markdown file: %s", filepath);
+        return XO_ERROR_FILE_NOT_FOUND;
+    }
+    
+    // Get the layout
+    const char *layout_name = xo_markdown_get_frontmatter(&md, "layout");
+    if (!layout_name) {
+        layout_name = "default";
+    }
+    
+    char layout_path[XO_MAX_PATH];
+    sprintf(layout_path, "%s/%s.html", config->layouts_dir, layout_name);
+    
+    // Add layout as a dependency
+    xo_dependency_tracker_add(tracker, filepath, layout_path);
+    
+    // Convert markdown to HTML
+    char *html_content;
+    if (xo_markdown_to_html(&md, &html_content) != XO_SUCCESS) {
+        xo_utils_console_error("Failed to convert markdown to HTML: %s", filepath);
+        xo_markdown_free(&md);
+        return XO_ERROR_INVALID_FORMAT;
+    }
+    
+    // Create template context
+    xo_template_context_t ctx;
+    xo_template_context_init(&ctx);
+    
+    // Add frontmatter values to context
+    for (size_t i = 0; i < md.frontmatter.count; i++) {
+        xo_template_context_add_string(&ctx, md.frontmatter.items[i].key, md.frontmatter.items[i].value);
+    }
+    
+    // Add content to context
+    xo_template_context_add_string(&ctx, "content", html_content);
+    
+    // Add other useful values
+    xo_template_context_add_string(&ctx, "baseUrl", "/");  // Default base URL
+    
+    // Load partials
+    xo_template_partials_t partials;
+    xo_template_partials_init(&partials);
+    
+    // TODO: Load partials from content/_partials directory
+    
+    // Render the template
+    char *final_html;
+    if (xo_template_render_file(layout_path, &ctx, &partials, &final_html) != XO_SUCCESS) {
+        xo_utils_console_error("Failed to render template: %s", layout_path);
+        free(html_content);
+        xo_template_context_free(&ctx);
+        xo_template_partials_free(&partials);
+        xo_markdown_free(&md);
+        return XO_ERROR_INVALID_FORMAT;
+    }
+    
+    // Determine the output path
+    char output_path[XO_MAX_PATH];
+    
+    // Calculate the relative path from content directory
+    char *rel_path = filepath;
+    size_t content_dir_len = strlen(config->content_dir);
+    if (strncmp(filepath, config->content_dir, content_dir_len) == 0) {
+        rel_path = filepath + content_dir_len;
+        // Skip leading slash if present
+        if (*rel_path == '/' || *rel_path == '\\') {
+            rel_path++;
+        }
+    }
+    
+    // Replace .md extension with /index.html
+    char *ext = strrchr(rel_path, '.');
+    if (ext && strcmp(ext, ".md") == 0) {
+        *ext = '\0'; // Terminate before the extension
+    }
+    
+    // Special case for index.md files
+    if (strcmp(rel_path, "index") == 0) {
+        sprintf(output_path, "%s/index.html", config->output_dir);
+    } else {
+        sprintf(output_path, "%s/%s/index.html", config->output_dir, rel_path);
+    }
+    
+    // Create directory structure
+    char *output_dir = xo_utils_dirname(output_path);
+    if (!output_dir) {
+        xo_utils_console_error("Failed to get output directory");
+        free(final_html);
+        free(html_content);
+        xo_template_context_free(&ctx);
+        xo_template_partials_free(&partials);
+        xo_markdown_free(&md);
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    if (xo_utils_mkdir_p(output_dir) != 0) {
+        xo_utils_console_error("Failed to create output directory: %s", output_dir);
+        free(output_dir);
+        free(final_html);
+        free(html_content);
+        xo_template_context_free(&ctx);
+        xo_template_partials_free(&partials);
+        xo_markdown_free(&md);
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    free(output_dir);
+    
+    // Write the output file
+    if (xo_utils_write_file(output_path, final_html) != 0) {
+        xo_utils_console_error("Failed to write output file: %s", output_path);
+        free(final_html);
+        free(html_content);
+        xo_template_context_free(&ctx);
+        xo_template_partials_free(&partials);
+        xo_markdown_free(&md);
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    xo_utils_console_success("Built: %s -> %s", filepath, output_path);
+    
+    // Clean up
+    free(final_html);
+    free(html_content);
+    xo_template_context_free(&ctx);
+    xo_template_partials_free(&partials);
+    xo_markdown_free(&md);
+    
+    return XO_SUCCESS;
+}
+
+// Get all markdown files in a directory
+static int get_markdown_files(const char *dir_path, char ***files, size_t *count) {
+    if (!dir_path || !files || !count) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    // TODO: Implement directory traversal to find markdown files
+    // For now, return an empty list
+    *files = NULL;
+    *count = 0;
+    
+    return XO_SUCCESS;
+}
+
+// Build all markdown files in a directory
+int xo_build_directory(const xo_config_t *config, const char *dirpath, xo_dependency_tracker_t *tracker) {
+    if (!config || !dirpath || !tracker) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    char **files;
+    size_t file_count;
+    
+    if (get_markdown_files(dirpath, &files, &file_count) != XO_SUCCESS) {
+        xo_utils_console_error("Failed to get markdown files from directory: %s", dirpath);
+        return XO_ERROR_FILE_NOT_FOUND;
+    }
+    
+    for (size_t i = 0; i < file_count; i++) {
+        xo_build_file(config, files[i], tracker);
+        free(files[i]);
+    }
+    
+    free(files);
+    
+    return XO_SUCCESS;
+}
 
 // Initialize a sample project
 int xo_init_project(const xo_config_t *config) {
@@ -128,21 +620,61 @@ int xo_init_project(const xo_config_t *config) {
     return XO_SUCCESS;
 }
 
-// Placeholder for the build function
+// Main build function
 int xo_build(const xo_config_t *config) {
-    // For now, just create the output directory
-    int result = xo_utils_mkdir_p(config->output_dir);
-    if (result != 0) {
-        xo_utils_console_error("Failed to create output directory");
-        return result;
+    if (!config) {
+        return XO_ERROR_MEMORY_ALLOCATION;
     }
     
-    xo_utils_console_info("Build functionality not fully implemented yet");
+    xo_utils_console_info("Building site to: %s", config->output_dir);
+    
+    // Create the output directory
+    if (xo_utils_mkdir_p(config->output_dir) != 0) {
+        xo_utils_console_error("Failed to create output directory: %s", config->output_dir);
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    // Initialize dependency tracker
+    xo_dependency_tracker_t tracker;
+    xo_dependency_tracker_init(&tracker);
+    
+    // Process all markdown files
+    // For now, we'll just process the index.md file
+    char index_path[XO_MAX_PATH];
+    sprintf(index_path, "%s/index.md", config->content_dir);
+    
+    if (xo_utils_file_exists(index_path)) {
+        xo_build_file(config, index_path, &tracker);
+    } else {
+        xo_utils_console_warning("No index.md file found");
+    }
+    
+    // TODO: Process all markdown files in the content directory
+    
+    // Clean up
+    xo_dependency_tracker_free(&tracker);
+    
+    xo_utils_console_success("Build completed successfully");
+    
     return XO_SUCCESS;
 }
 
-// Placeholder for the dev server function
+// Main development server function
 int xo_dev_server(const xo_config_t *config) {
-    xo_utils_console_info("Development server not implemented yet");
+    if (!config) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    // First, build the site
+    int result = xo_build(config);
+    if (result != XO_SUCCESS) {
+        return result;
+    }
+    
+    xo_utils_console_info("Development server not fully implemented yet");
+    xo_utils_console_info("Starting server on port %d", config->server_port);
+    
+    // TODO: Implement development server
+    
     return XO_SUCCESS;
 } 
