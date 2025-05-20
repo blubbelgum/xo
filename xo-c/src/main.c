@@ -13,6 +13,8 @@ static int parse_arguments(int argc, char *argv[], xo_config_t *config) {
     strcpy(config->output_dir, "dist");
     config->server_port = 3000;
     config->clean_build = false;
+    config->running = false;  // Initialize running flag
+    config->user_data = NULL; // Initialize user data
 
     // Parse arguments
     for (int i = 1; i < argc; i++) {

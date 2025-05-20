@@ -3,6 +3,18 @@
 
 #include "xo.h"
 
+#ifdef _WIN32
+    #include <windows.h>
+#else
+    #include <dirent.h>
+    #include <sys/types.h>
+    #include <sys/stat.h>
+    #include <unistd.h>
+#endif
+
+// File callback function type
+typedef int (*xo_file_callback_t)(const char *filepath, void *user_data);
+
 // Path utilities
 char *xo_utils_join_path(const char *base, const char *path);
 char *xo_utils_dirname(const char *path);
@@ -36,5 +48,8 @@ void xo_utils_console_info(const char *fmt, ...);
 void xo_utils_console_success(const char *fmt, ...);
 void xo_utils_console_warning(const char *fmt, ...);
 void xo_utils_console_error(const char *fmt, ...);
+
+// Directory utilities
+int xo_utils_traverse_directory(const char *dirpath, xo_file_callback_t callback, void *user_data);
 
 #endif /* XO_UTILS_H */ 

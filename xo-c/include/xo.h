@@ -8,6 +8,7 @@
 
 // Platform-specific definitions
 #ifdef _WIN32
+    #include <winsock2.h>
     #include <windows.h>
     #define PATH_SEPARATOR '\\'
 #else
@@ -44,6 +45,8 @@ typedef struct {
     char output_dir[XO_MAX_PATH];
     int server_port;
     bool clean_build;
+    bool running;         // Flag for controlling the dev server
+    void *user_data;      // User data for callbacks
 } xo_config_t;
 
 // Function declarations

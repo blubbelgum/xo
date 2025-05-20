@@ -239,6 +239,47 @@ char *xo_utils_strndup(const char *str, size_t n) {
     return result;
 }
 
+char *xo_utils_str_replace(const char *str, const char *search, const char *replace) {
+    if (!str || !search || !replace) {
+        return NULL;
+    }
+    
+    const char *pos = strstr(str, search);
+    if (!pos) {
+        return strdup(str);  // Return a copy of the original if search string not found
+    }
+    
+    size_t str_len = strlen(str);
+    size_t search_len = strlen(search);
+    size_t replace_len = strlen(replace);
+    
+    // Calculate the new string length
+    size_t result_len = str_len - search_len + replace_len;
+    
+    // Allocate memory for the result
+    char *result = (char *)malloc(result_len + 1);
+    if (!result) {
+        return NULL;
+    }
+    
+    // Copy the part before the search string
+    size_t prefix_len = pos - str;
+    memcpy(result, str, prefix_len);
+    
+    // Copy the replacement string
+    memcpy(result + prefix_len, replace, replace_len);
+    
+    // Copy the part after the search string
+    memcpy(result + prefix_len + replace_len, 
+           pos + search_len, 
+           str_len - prefix_len - search_len);
+    
+    // Null-terminate the result
+    result[result_len] = '\0';
+    
+    return result;
+}
+
 void xo_utils_str_trim(char *str) {
     if (!str) {
         return;
@@ -402,4 +443,114 @@ void xo_utils_console_error(const char *fmt, ...) {
     printf("%s\n", ANSI_RESET);
     
     va_end(args);
+}
+
+// Traverse a directory recursively and call a callback for each file
+int xo_utils_traverse_directory(const char *dirpath, xo_file_callback_t callback, void *user_data) {
+    if (!dirpath || !callback) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    char path[XO_MAX_PATH];
+    
+#ifdef _WIN32
+    // Windows implementation
+    WIN32_FIND_DATA find_data;
+    HANDLE find_handle;
+    
+    // Create search pattern (dir\*)
+    snprintf(path, sizeof(path), "%s\\*", dirpath);
+    
+    // Start search
+    find_handle = FindFirstFile(path, &find_data);
+    if (find_handle == INVALID_HANDLE_VALUE) {
+        DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND) {
+            return XO_SUCCESS; // Empty directory
+        }
+        xo_utils_console_error("Failed to traverse directory: %s (error %lu)", dirpath, error);
+        return XO_ERROR_FILE_NOT_FOUND;
+    }
+    
+    do {
+        // Skip "." and ".." entries
+        if (strcmp(find_data.cFileName, ".") == 0 || strcmp(find_data.cFileName, "..") == 0) {
+            continue;
+        }
+        
+        // Construct full path
+        snprintf(path, sizeof(path), "%s\\%s", dirpath, find_data.cFileName);
+        
+        if (find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            // Recurse into subdirectory
+            int result = xo_utils_traverse_directory(path, callback, user_data);
+            if (result != XO_SUCCESS) {
+                FindClose(find_handle);
+                return result;
+            }
+        } else {
+            // Call the callback for the file
+            int result = callback(path, user_data);
+            if (result != XO_SUCCESS) {
+                FindClose(find_handle);
+                return result;
+            }
+        }
+    } while (FindNextFile(find_handle, &find_data));
+    
+    FindClose(find_handle);
+    
+    // Check for errors
+    DWORD error = GetLastError();
+    if (error != ERROR_NO_MORE_FILES) {
+        xo_utils_console_error("Error while traversing directory: %s (error %lu)", dirpath, error);
+        return XO_ERROR_FILE_NOT_FOUND;
+    }
+#else
+    // POSIX implementation
+    DIR *dir = opendir(dirpath);
+    if (!dir) {
+        xo_utils_console_error("Failed to open directory: %s", dirpath);
+        return XO_ERROR_FILE_NOT_FOUND;
+    }
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip "." and ".." entries
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        
+        // Construct full path
+        snprintf(path, sizeof(path), "%s/%s", dirpath, entry->d_name);
+        
+        // Get file status
+        struct stat st;
+        if (stat(path, &st) != 0) {
+            xo_utils_console_error("Failed to stat file: %s", path);
+            closedir(dir);
+            return XO_ERROR_FILE_NOT_FOUND;
+        }
+        
+        if (S_ISDIR(st.st_mode)) {
+            // Recurse into subdirectory
+            int result = xo_utils_traverse_directory(path, callback, user_data);
+            if (result != XO_SUCCESS) {
+                closedir(dir);
+                return result;
+            }
+        } else {
+            // Call the callback for the file
+            int result = callback(path, user_data);
+            if (result != XO_SUCCESS) {
+                closedir(dir);
+                return result;
+            }
+        }
+    }
+    
+    closedir(dir);
+#endif
+    
+    return XO_SUCCESS;
 } 

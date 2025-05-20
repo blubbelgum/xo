@@ -21,7 +21,7 @@ typedef struct {
 typedef void (*xo_watcher_callback_t)(const xo_file_event_t *event, void *user_data);
 
 // File watcher structure
-typedef struct {
+typedef struct xo_watcher_s {
     void *handle;
     char **watch_paths;
     size_t path_count;

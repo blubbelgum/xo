@@ -4,8 +4,33 @@
 #include <stdbool.h>
 #include <time.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+    #include <winsock2.h>  // Include winsock2.h before windows.h
+    #include <windows.h>
+    #define thread_sleep(ms) Sleep(ms)
+    
+    // Windows threading
+    typedef HANDLE thread_handle_t;
+    typedef DWORD WINAPI thread_func_t(LPVOID);
+    #define thread_create(handle, func, arg) (((*(handle)) = CreateThread(NULL, 0, (func), (arg), 0, NULL)) == NULL)
+    #define thread_join(handle) WaitForSingleObject((handle), INFINITE); CloseHandle((handle))
+#else
+    #include <unistd.h>
+    #include <pthread.h>
+    #define thread_sleep(ms) usleep((ms) * 1000)
+    
+    // POSIX threading
+    typedef pthread_t thread_handle_t;
+    typedef void *(*thread_func_t)(void *);
+    #define thread_create(handle, func, arg) pthread_create((handle), NULL, (func), (arg))
+    #define thread_join(handle) pthread_join((handle), NULL)
+#endif
+
 #include "build.h"
 #include "utils.h"
+#include "server.h"
+#include "watcher.h"
 #include "markdown.h"
 #include "template.h"
 
@@ -356,6 +381,85 @@ char **xo_dependency_tracker_get_reverse(const xo_dependency_tracker_t *tracker,
     return result;
 }
 
+// Structure to collect markdown files during traversal
+typedef struct {
+    char **files;
+    size_t count;
+    size_t capacity;
+} xo_file_collector_t;
+
+// Callback for directory traversal to collect markdown files
+static int collect_markdown_files_callback(const char *filepath, void *user_data) {
+    if (!filepath || !user_data) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    xo_file_collector_t *collector = (xo_file_collector_t *)user_data;
+    
+    // Check if the file is a markdown file
+    const char *ext = xo_utils_get_extension(filepath);
+    if (!ext || (strcmp(ext, "md") != 0 && strcmp(ext, "markdown") != 0)) {
+        return XO_SUCCESS;
+    }
+    
+    // Skip files in _partials directory
+    if (strstr(filepath, "_partials") != NULL) {
+        return XO_SUCCESS;
+    }
+    
+    // Check if we need to resize the array
+    if (collector->count >= collector->capacity) {
+        size_t new_capacity = collector->capacity == 0 ? 8 : collector->capacity * 2;
+        char **new_files = realloc(collector->files, new_capacity * sizeof(char *));
+        
+        if (!new_files) {
+            return XO_ERROR_MEMORY_ALLOCATION;
+        }
+        
+        collector->files = new_files;
+        collector->capacity = new_capacity;
+    }
+    
+    // Add the file to the collector
+    collector->files[collector->count] = strdup(filepath);
+    if (!collector->files[collector->count]) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    collector->count++;
+    
+    return XO_SUCCESS;
+}
+
+// Get all markdown files in a directory
+static int get_markdown_files(const char *dir_path, char ***files, size_t *count) {
+    if (!dir_path || !files || !count) {
+        return XO_ERROR_MEMORY_ALLOCATION;
+    }
+    
+    // Initialize the collector
+    xo_file_collector_t collector;
+    collector.files = NULL;
+    collector.count = 0;
+    collector.capacity = 0;
+    
+    // Traverse the directory and collect markdown files
+    int result = xo_utils_traverse_directory(dir_path, collect_markdown_files_callback, &collector);
+    if (result != XO_SUCCESS) {
+        for (size_t i = 0; i < collector.count; i++) {
+            free(collector.files[i]);
+        }
+        free(collector.files);
+        return result;
+    }
+    
+    // Set the output parameters
+    *files = collector.files;
+    *count = collector.count;
+    
+    return XO_SUCCESS;
+}
+
 // Build a single markdown file
 int xo_build_file(const xo_config_t *config, const char *filepath, xo_dependency_tracker_t *tracker) {
     if (!config || !filepath || !tracker) {
@@ -494,20 +598,6 @@ int xo_build_file(const xo_config_t *config, const char *filepath, xo_dependency
     xo_template_context_free(&ctx);
     xo_template_partials_free(&partials);
     xo_markdown_free(&md);
-    
-    return XO_SUCCESS;
-}
-
-// Get all markdown files in a directory
-static int get_markdown_files(const char *dir_path, char ***files, size_t *count) {
-    if (!dir_path || !files || !count) {
-        return XO_ERROR_MEMORY_ALLOCATION;
-    }
-    
-    // TODO: Implement directory traversal to find markdown files
-    // For now, return an empty list
-    *files = NULL;
-    *count = 0;
     
     return XO_SUCCESS;
 }
@@ -659,22 +749,128 @@ int xo_build(const xo_config_t *config) {
     return XO_SUCCESS;
 }
 
-// Main development server function
+// Development server handler
+#ifdef _WIN32
+static DWORD WINAPI xo_dev_server_handler(LPVOID arg) {
+#else
+static void *xo_dev_server_handler(void *arg) {
+#endif
+    xo_config_t *config = (xo_config_t *)arg;
+    
+    // Keep running until the signal to stop
+    while (config->running) {
+        // Sleep for a bit to avoid high CPU usage
+        thread_sleep(1000);  // 1 second
+    }
+    
+    return 0;
+}
+
+// Start the development server
 int xo_dev_server(const xo_config_t *config) {
     if (!config) {
         return XO_ERROR_MEMORY_ALLOCATION;
     }
     
-    // First, build the site
+    // Make config mutable for our internal use
+    xo_config_t *mutable_config = (xo_config_t *)config;
+    mutable_config->running = true;
+    
+    // First, build the project
+    xo_utils_console_info("Building project...");
     int result = xo_build(config);
     if (result != XO_SUCCESS) {
+        xo_utils_console_error("Failed to build project");
         return result;
     }
     
-    xo_utils_console_info("Development server not fully implemented yet");
-    xo_utils_console_info("Starting server on port %d", config->server_port);
+    // Initialize server
+    xo_server_t server;
+    memset(&server, 0, sizeof(server));
+    result = xo_server_init(&server, config);
+    if (result != XO_SUCCESS) {
+        xo_utils_console_error("Failed to initialize server");
+        return result;
+    }
     
-    // TODO: Implement development server
+    // Set the server in the config user_data for callbacks
+    mutable_config->user_data = &server;
+    
+    // Start the server
+    result = xo_server_start(&server, xo_http_handler, &server);
+    if (result != XO_SUCCESS) {
+        xo_utils_console_error("Failed to start server");
+        xo_server_free(&server);
+        return result;
+    }
+    
+    // Initialize watcher
+    xo_watcher_t watcher;
+    result = xo_watcher_init(&watcher);
+    if (result != XO_SUCCESS) {
+        xo_utils_console_error("Failed to initialize file watcher");
+        xo_server_stop(&server);
+        xo_server_free(&server);
+        return result;
+    }
+    
+    // Add paths to watch
+    result = xo_watcher_add_path(&watcher, config->content_dir);
+    if (result != XO_SUCCESS) {
+        xo_utils_console_error("Failed to add content directory to watcher");
+        xo_watcher_free(&watcher);
+        xo_server_stop(&server);
+        xo_server_free(&server);
+        return result;
+    }
+    
+    result = xo_watcher_add_path(&watcher, config->layouts_dir);
+    if (result != XO_SUCCESS) {
+        xo_utils_console_error("Failed to add layouts directory to watcher");
+        xo_watcher_free(&watcher);
+        xo_server_stop(&server);
+        xo_server_free(&server);
+        return result;
+    }
+    
+    // Start the watcher
+    result = xo_watcher_start(&watcher, xo_handle_file_event, (void *)mutable_config);
+    if (result != XO_SUCCESS) {
+        xo_utils_console_error("Failed to start file watcher");
+        xo_watcher_free(&watcher);
+        xo_server_stop(&server);
+        xo_server_free(&server);
+        return result;
+    }
+    
+    // Create thread data for handler
+    thread_handle_t dev_thread;
+    if (thread_create(&dev_thread, xo_dev_server_handler, mutable_config) != 0) {
+        xo_utils_console_error("Failed to create dev server thread");
+        xo_watcher_stop(&watcher);
+        xo_watcher_free(&watcher);
+        xo_server_stop(&server);
+        xo_server_free(&server);
+        return XO_ERROR_SERVER;
+    }
+    
+    // Display information to the user
+    xo_utils_console_success("Development server started:");
+    xo_utils_console_info("- Web server running at http://localhost:%d", config->server_port);
+    xo_utils_console_info("- Watching for changes in %s and %s", config->content_dir, config->layouts_dir);
+    xo_utils_console_info("- Press Ctrl+C to stop the server");
+    
+    // Wait for user to press Ctrl+C
+    // The actual handling of Ctrl+C depends on the shell/terminal
+    // and is not implemented here since it's platform-specific
+    thread_join(dev_thread);
+    
+    // Cleanup
+    mutable_config->running = false;
+    xo_watcher_stop(&watcher);
+    xo_watcher_free(&watcher);
+    xo_server_stop(&server);
+    xo_server_free(&server);
     
     return XO_SUCCESS;
 } 

@@ -340,6 +340,13 @@ int xo_template_render(const char *template_str, const xo_template_context_t *ct
         if (*p == '{' && *(p + 1) == '{') {
             // Found the start of a tag
             const char *tag_start = p + 2;
+            bool is_triple = false;
+            
+            // Check if it's a triple brace tag {{{ for unescaped HTML
+            if (*tag_start == '{') {
+                is_triple = true;
+                tag_start++;
+            }
             
             // Check if it's a partial
             bool is_partial = false;
@@ -353,7 +360,18 @@ int xo_template_render(const char *template_str, const xo_template_context_t *ct
             }
             
             // Look for the end of the tag
-            const char *tag_end = strstr(tag_start, "}}");
+            const char *tag_end;
+            if (is_triple) {
+                // For triple braces, look for }}}, which means tag ends with }}
+                tag_end = strstr(tag_start, "}}}");
+                if (tag_end) {
+                    tag_end--; // Move back one character to the second }
+                }
+            } else {
+                // For double braces, look for }}
+                tag_end = strstr(tag_start, "}}");
+            }
+            
             if (tag_end) {
                 // Extract the tag name
                 size_t tag_len = tag_end - tag_start;
@@ -408,7 +426,11 @@ int xo_template_render(const char *template_str, const xo_template_context_t *ct
                 free(tag_name);
                 
                 // Move past the end of the tag
-                p = tag_end + 2;
+                if (is_triple) {
+                    p = tag_end + 3; // Skip past }}}
+                } else {
+                    p = tag_end + 2; // Skip past }}
+                }
             } else {
                 // No end tag found, just output the character
                 if (result_len + 1 >= buffer_size) {
