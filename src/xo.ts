@@ -2,7 +2,6 @@
 
 import { run } from "./dev";
 import { build } from "./bun.build";
-import { defaultConfig } from "./config";
 
 function showHelp() {
   console.log(`
