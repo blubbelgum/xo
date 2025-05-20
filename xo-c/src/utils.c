@@ -12,6 +12,10 @@
 #define mkdir(path, mode) _mkdir(path)
 #define access _access
 #define F_OK 0
+// Define S_ISDIR for Windows
+#ifndef S_ISDIR
+#define S_ISDIR(mode) (((mode) & S_IFMT) == S_IFDIR)
+#endif
 #else
 #include <unistd.h>
 #include <dirent.h>
