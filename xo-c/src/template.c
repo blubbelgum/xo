@@ -362,11 +362,8 @@ int xo_template_render(const char *template_str, const xo_template_context_t *ct
             // Look for the end of the tag
             const char *tag_end;
             if (is_triple) {
-                // For triple braces, look for }}}, which means tag ends with }}
+                // For triple braces, look for }}}
                 tag_end = strstr(tag_start, "}}}");
-                if (tag_end) {
-                    tag_end--; // Move back one character to the second }
-                }
             } else {
                 // For double braces, look for }}
                 tag_end = strstr(tag_start, "}}");
