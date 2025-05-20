@@ -56,6 +56,7 @@ typedef struct xo_watcher_s xo_watcher_t;
 
 #include "watcher.h"
 #include "utils.h"
+#include "server.h"
 
 // Initialize a file watcher
 int xo_watcher_init(xo_watcher_t *watcher) {
